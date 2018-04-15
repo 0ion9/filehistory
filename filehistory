@@ -1,0 +1,98 @@
+#!/bin/sh
+# Simple file history tracker
+#
+# Syntax:
+#   imghistory [filenames]
+#
+#   Stores revision history in $FILENAME.hist , eg. history for /tmp/apple.png goes in
+#   /tmp/apple.png.hist .
+#   Each history item has a filename of the form REVISION-HASH.EXT, eg
+#   000009-8ec1de823750e574dc533e9ae79659dc.png
+#   History tracking continues until imghistory is terminated (Ctrl+C)
+#
+# Requires: 
+#   inotifywait,
+#   zenity,
+#   md5sum,
+#   notify-send
+
+# The format used to construct history filenames. You may want to modify the 
+# width of the %d format (3 digits is probably plenty, I chose 6 just to be on the very safe side)
+FORMAT='%06d-%s'
+
+IFS="$(printf '\n')"
+
+saverev () {
+  FN="$1"
+  DIRN="$2"
+  HSH="$3"
+  BASE=$(basename "$FN")
+  EXT="${BASE#*.}"
+  if [ "$BASE" == "$EXT" ]; then
+    EXT=''
+  else
+    EXT=."$EXT"
+  fi
+  mkdir -p "$DIRN" > /dev/null
+  HISTORYN=$(find "$DIRN" -type f -iname '[0-9]*-*' -not -iname '[.~]*'| sort -n | tail -1)
+  HISTORYN=$(basename "$HISTORYN" | grep -Eoe '^[0-9]+')
+  # Strip all 0's from start of HISTORYN
+  OH="$HISTORYN"
+  HISTORYN=${HISTORYN#0}
+  while [ "$OH" != "$HISTORYN" ]; do
+    OH="$HISTORYN"
+    HISTORYN=${HISTORYN#0}
+  done
+  NEXTN=$((HISTORYN+1))
+  DEST=$(printf "%s/$FORMAT%s" "$DIRN" "$NEXTN" "$HSH" "$EXT")
+  LOG=$(zenity --entry --text Changes: --title "Enter log message for r$NEXTN:$HSH")
+  if [ -z "$LOG" ]; then
+    notify-send "Commit of r$NEXTN:$HSH aborted." "This revision will not be included in history."
+  else
+    cp -av "$FN" "$DEST"
+    DESTBASE=$(basename "$DEST")
+    printf '%s\t\t%s\n' "$DESTBASE" "$LOG" >> "$DIRN/log.txt"
+  fi
+}
+
+# inotifywait only detects changes made while it is running. Some changes may have occurred before
+# this point; make sure they are recorded too.
+echo "Checking for initial changes.."
+for FILENAME; do
+  HASH=$(md5sum < "$FILENAME" | cut -d ' ' -f 1)
+  DIRNAME="$FILENAME.hist"
+  mkdir -p "$DIRNAME" > /dev/null
+  LAST=$(find "$DIRNAME" -type f -not -iname 'log.txt' -not -iname '[.~]*'| sort | tail -1)
+  if [ -z "$LAST" ]; then
+    echo "Committing first revision of '$FILENAME'"
+    saverev "$FILENAME" "$DIRNAME" "$HASH"
+    continue
+  fi
+  LASTH=$(basename "$LAST")
+#  echo "LASTH 1 : $LASTH"
+  LASTH=${LASTH%%.*}
+  LASTH=${LASTH##*-}
+#  echo "h: $HASH lh:$LASTH"
+  if [ "$LASTH" != "$HASH" ]; then
+    saverev "$FILENAME" "$DIRNAME" "$HASH"
+  fi
+done
+
+echo "Tracking files.."
+inotifywait -m -e close_write "$@" 2>/dev/null | while read RECORD; do
+  FILENAME="${RECORD%% CLOSE*}"
+  DIRNAME="$FILENAME.hist"
+  LAST=$(find "$DIRNAME" -type f -iname '[0-9]*' -not -iname '[.~]*'| sort | tail -1)
+  LASTH=$(basename "$LAST")
+  LASTH=${LASTH%%.*}
+  LASTH=${LASTH##*-}
+  HASH=$(md5sum < "$FILENAME" | cut -d ' ' -f 1)
+  if [ "$LASTH" != "$HASH" ]; then
+    saverev "$FILENAME" "$DIRNAME" "$HASH"
+  fi
+
+  # XXX hashes may sometimes repeat (when you revert back to an older version).
+  # we could save some space via noticing when a given hash is already used, and making the new file just a
+  # symlink to the existing history file.
+
+done
